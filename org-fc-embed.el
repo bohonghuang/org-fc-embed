@@ -256,12 +256,17 @@ The flashcard export buffer is current and still narrowed."
   (org-cut-subtree)
   (org-fc-embed-export-finish))
 
+(defcustom org-fc-embed-export-flashcard-type 'normal
+  "Default type used when exporting an Org flashcard."
+  :group 'org-fc-embed
+  :type `(choice . ,(mapcar (lambda (type) `(const ,(car type))) org-fc-types)))
+
 (cl-defgeneric org-fc-embed-export-flashcard (type props)
   (let* ((element (list type props))
          (buffer (current-buffer))
          (content (buffer-substring (org-element-begin element) (org-element-end element)))
          (window-configuration (current-window-configuration))
-         (type 'org-fc-type-normal-init))
+         (type org-fc-embed-export-flashcard-type))
     (with-current-buffer (switch-to-buffer (find-file-noselect (funcall org-fc-embed-fc-file)))
       (setf org-fc-embed-export-window-configuration window-configuration)
       (goto-char (point-max))
@@ -272,17 +277,17 @@ The flashcard export buffer is current and still narrowed."
         (insert content)
         (delete-blank-lines))
       (indent-region (point) (point-max))
-      (when (cl-plusp (org-fc-embed-export-clozes (point)))
-        (setf type #'org-fc-type-cloze-init))
+      (if (cl-plusp (org-fc-embed-export-clozes (point)))
+          (setf type 'cloze)
+        (cl-assert (not (eq type 'cloze))))
       (org-back-to-heading)
       (org-end-of-line)
-      (org-fc-embed-export-mode +1)
       (cl-assert (null org-fc-embed-prepare-finalize-hook))
       (cl-assert (not (cl-member 'org-fc-embed-prepare-finalize-hook (buffer-local-variables) :key #'car)))
       (add-hook
        'org-fc-embed-prepare-finalize-hook
        (letrec ((hook (lambda ()
-                        (call-interactively type)
+                        (call-interactively (intern (format "%s%s%s" 'org-fc-type- type '-init)))
                         (let ((id (org-id-get))
                               (front (cl-fifth (org-heading-components))))
                           (cl-assert id) (cl-assert front)
@@ -300,7 +305,8 @@ The flashcard export buffer is current and still narrowed."
                                 (org-fc-embed-update-overlays start (point))))))
                         (remove-hook 'org-fc-embed-prepare-finalize-hook hook))))
          hook)
-       nil t))))
+       nil t)
+      (org-fc-embed-export-mode +1))))
 
 (defun org-fc-embed-link-file-position ()
   (cl-assert (looking-at (rx "[" "[" (group (*? anychar)) "]" (*? anychar) "]")))
@@ -337,23 +343,28 @@ The flashcard export buffer is current and still narrowed."
         (org-fc-update)))))
 
 (defun org-fc-embed-goto-link-to-flashcard ()
-  (let ((marker (point-marker))
-        (current-end (org-element-end (org-element-at-point)))
-        (child-start (or (ignore-errors
-                           (org-down-element)
-                           (org-element-begin (org-element-at-point)))
-                         (point-max))))
-    (cl-loop for element = (if (ignore-errors (org-backward-element) t)
-                               (org-element-at-point)
-                             (when fallback-start
-                               (goto-char fallback-start))
-                             (cl-return))
-             for (element-start . element-end) = (cons (org-element-begin element) (org-element-end element))
-             when (< element-end current-end) unless (org-at-keyword-p) return (goto-char element-end)
-             maximize element-start into fallback-start)
-    (or (let ((case-fold-search t))
-          (re-search-forward (rx "+fc_front:" (* blank)) (min current-end child-start) t))
-        (null (goto-char marker)))))
+  (cl-flet ((org-element-at-point (&aux (element (org-element-at-point)))
+              (cl-case (org-element-type element)
+                (plain-list (org-element-at-point (1+ (point))))
+                (headline (org-element-at-point (1- (point))))
+                (t element))))
+    (let ((marker (point-marker))
+          (current-end (org-element-end (org-element-at-point)))
+          (child-start (or (ignore-errors
+                             (org-down-element)
+                             (org-element-begin (org-element-at-point)))
+                           (point-max))))
+      (cl-loop for element = (if (ignore-errors (org-backward-element) t)
+                                 (or (org-element-at-point) (cl-return))
+                               (when fallback-start
+                                 (goto-char fallback-start))
+                               (cl-return))
+               for (element-start . element-end) = (cons (org-element-begin element) (org-element-end element))
+               when (< element-end current-end) unless (org-at-keyword-p) return (goto-char element-end)
+               maximize element-start into fallback-start)
+      (or (let ((case-fold-search t))
+            (re-search-forward (rx "+fc_front:" (* blank)) (min current-end child-start) t))
+          (null (goto-char marker))))))
 
 ;;;###autoload
 (defun org-fc-embed-open-flashcard ()
@@ -365,15 +376,47 @@ The flashcard export buffer is current and still narrowed."
     (find-file file)
     (goto-char position)))
 
+(defcustom org-fc-embed-export-front-regexp (rx (* blank) (? "- ") (group (*? anychar)) (char "：:"))
+  "Default regexp used to extract the front content of flashcards in batch export."
+  :group 'org-fc-embed
+  :type 'regexp)
+
 ;;;###autoload
-(defun org-fc-embed-ensure-flashcard ()
-  (interactive)
-  (let ((element (org-element-at-point)))
-    (cl-assert (not (cl-find (org-element-type element) '(comment keyword))))
-    (save-excursion
-      (if (org-fc-embed-goto-link-to-flashcard)
-          (apply #'org-fc-embed-update-flashcard element)
-        (apply #'org-fc-embed-export-flashcard element)))))
+(cl-defun org-fc-embed-ensure-flashcard (arg)
+  (interactive "p")
+  (cl-flet ((ensure-flashcard (&optional (element (org-element-at-point)))
+              (cl-assert (not (cl-find (org-element-type element) '(comment keyword))))
+              (save-excursion
+                (if (org-fc-embed-goto-link-to-flashcard)
+                    (apply #'org-fc-embed-update-flashcard element)
+                  (apply #'org-fc-embed-export-flashcard element))))
+            (org-forward-element ()
+              (cl-case (org-element-type (org-element-at-point))
+                (plain-list (forward-char) (org-forward-element))
+                (t (org-forward-element)))))
+    (let ((org-fc-embed-export-flashcard-type
+           (if (> arg 1) (intern (completing-read "Card type: " (mapcar #'car org-fc-types) nil t))
+             org-fc-embed-export-flashcard-type)))
+      (if (region-active-p)
+          (let* ((front "")
+                 (front-regexp (if (> arg 1) (read-string "Front content regexp: " org-fc-embed-export-front-regexp)
+                                 org-fc-embed-export-front-regexp))
+                 (export-hook (lambda ()
+                                (when org-fc-embed-export-mode
+                                  (insert front)
+                                  (org-fc-embed-export-finalize)))))
+            (unwind-protect
+                (cl-loop with start = (copy-marker (region-beginning)) and end = (copy-marker (region-end))
+                         initially (add-hook 'org-fc-embed-export-mode-hook export-hook) (deactivate-mark) (goto-char start)
+                         do (save-excursion
+                              (re-search-forward front-regexp (pos-eol))
+                              (setf front (match-string 1))
+                              (let ((element (org-element-copy (org-element-at-point))))
+                                (setf (org-element-begin element) (point))
+                                (ensure-flashcard element)))
+                         while (progn (org-forward-element) (<= (point) (marker-position end))))
+              (remove-hook 'org-fc-embed-export-mode-hook export-hook)))
+        (ensure-flashcard)))))
 
 (cl-defun org-fc-embed-cloze-table-fields (&optional (range '(1 . 1)))
   (cl-multiple-value-bind (row-start row-end column-start column-end)
