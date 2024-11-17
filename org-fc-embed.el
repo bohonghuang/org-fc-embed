@@ -35,13 +35,13 @@
   (save-excursion
     (goto-char start)
     (while (re-search-forward (rx "@@fc:" (group (+? anychar)) "@@") end t)
-      (let ((overlay (make-overlay
-                      (match-beginning 0)
-                      (match-end 0)
-                      nil 'front-advance)))
+      (let* ((overlay (make-overlay (match-beginning 0) (match-end 0) nil 'front-advance))
+             (string (match-string 1))
+             (padding (- (string-width (match-string 0)) (string-width (match-string 1))))
+             (openp (cl-plusp (cl-loop for char across string sum (cl-case char (?{ 1) (?} -1) (t 0))))))
         (overlay-put overlay 'category 'org-fc-cloze)
         (overlay-put overlay 'invisible nil)
-        (overlay-put overlay 'display (match-string 1))))))
+        (overlay-put overlay 'display (if (org-at-table-p) (string-pad string (+ (length string) padding) nil openp) string))))))
 
 (cl-defun org-fc-embed-remove-cloze-overlays (&optional (start (point-min)) (end (point-max)))
   (remove-overlays start end 'org-fc-cloze))
