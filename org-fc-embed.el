@@ -85,12 +85,10 @@
   (cl-assert (eq major-mode 'org-mode))
   (if org-fc-embed-overlay-mode (org-fc-embed-put-overlays) (org-fc-embed-remove-overlays)))
 
-;;;###autoload
-(cl-defun org-fc-embed-cloze-dwim (&optional hint &aux marker-start marker-end)
-  (interactive)
+(cl-defun org-fc-embed-cloze-1 (&optional (cloze-function #'org-fc-cloze-dwim) &aux marker-start marker-end)
   (save-excursion
     (setf marker-start (point-marker))
-    (if (called-interactively-p 'any) (call-interactively #'org-fc-cloze-dwim) (org-fc-cloze-dwim hint))
+    (funcall cloze-function)
     (re-search-forward (rx "}}") (pos-eol))
     (insert "@@")
     (setf marker-end (point-marker))
@@ -108,6 +106,82 @@
     (re-search-forward (rx "{{") marker-end)
     (insert "@@")
     (org-fc-embed-update-overlays marker-start marker-end)))
+
+(defvar org-fc-embed-cloze-interactive-p nil)
+
+(cl-defgeneric org-fc-embed-cloze (type &optional props)
+  (ignore type props)
+  (org-fc-embed-cloze-1
+   (if org-fc-embed-cloze-interactive-p
+       (lambda () (call-interactively #'org-fc-cloze-dwim))
+     #'org-fc-cloze-dwim)))
+
+(cl-defmethod org-fc-embed-cloze :around (_type &optional _props)
+  (cl-ecase org-fc-embed-cloze-interactive-p
+    ((t) (let ((org-fc-embed-cloze-interactive-p 'toplevel)) (cl-call-next-method)))
+    ((toplevel) (let ((org-fc-embed-cloze-interactive-p nil)) (cl-call-next-method)))
+    ((nil) (cl-call-next-method))))
+
+;;;###autoload
+(cl-defun org-fc-embed-cloze-dwim ()
+  (interactive)
+  (let ((org-fc-embed-cloze-interactive-p (called-interactively-p 'any)))
+    (if (region-active-p)
+        (org-fc-embed-cloze nil)
+      (apply #'org-fc-embed-cloze (org-element-at-point)))))
+
+(cl-defun org-fc-embed-process-clozes (&optional (start (point-min)) (end (point-max)) (process-function #'cl-values))
+  (save-excursion
+    (cl-loop with start = (copy-marker start) and end = (copy-marker end)
+             with regexp = (rx "@@fc:" (group (+? anychar)) "@@")
+             initially (goto-char start)
+             for cloze-start = (if (not (re-search-forward regexp end t))
+                                   (cl-return count)
+                                 (cl-assert (string-equal (match-string 1) "{{"))
+                                 (prog1 (save-excursion
+                                          (goto-char (match-end 0))
+                                          (point-marker))
+                                   (replace-match "\\1")))
+             for cloze-end = (if (not (re-search-forward regexp end t))
+                                 (cl-assert nil)
+                               (cl-assert (string-suffix-p "}}" (match-string 1)))
+                               (prog1 (save-excursion
+                                        (goto-char (match-beginning 0))
+                                        (point-marker))
+                                 (replace-match "\\1")))
+             for count from 0
+             for cloze = (string-trim (buffer-substring-no-properties cloze-start cloze-end))
+             do (funcall process-function cloze))))
+
+(defun org-fc-embed-uncloze-1 ()
+  (cl-multiple-value-bind (start end)
+      (if (region-active-p)
+          (cl-values (region-beginning) (region-end))
+        (let ((regexp-left (rx "@@fc:{{")) (regexp-right (rx "}}@@")))
+          (let ((bl (or (and (save-excursion (re-search-backward regexp-left (pos-bol) t)) (match-beginning 0)) (pos-bol)))
+                (br (or (and (save-excursion (re-search-backward regexp-right (pos-bol) t)) (match-end 0)) (pos-bol)))
+                (fl (or (and (save-excursion (re-search-forward regexp-left (pos-eol) t)) (match-beginning 0)) (pos-eol)))
+                (fr (or (and (save-excursion (re-search-forward regexp-right (pos-eol) t)) (match-end 0)) (pos-eol))))
+            (if (< (1- br) bl (point) fr (1+ fl)) (cl-values bl fr)
+              (cl-assert (< (1- (point)) fl fr)) (cl-values fl fr)))))
+    (let ((start (copy-marker start)) (end (copy-marker end)))
+      (prog1 (org-fc-embed-process-clozes
+              start end
+              (lambda (cloze)
+                (cl-assert (looking-back (rx "{{" (literal cloze) "}" (*? anychar) "}") (pos-bol)))
+                (replace-match cloze)))
+        (org-fc-embed-update-overlays start end)))))
+
+(cl-defgeneric org-fc-embed-uncloze (type &optional props)
+  (ignore type props)
+  (org-fc-embed-uncloze-1))
+
+;;;###autoload
+(cl-defun org-fc-embed-uncloze-dwim ()
+  (interactive)
+  (if (region-active-p)
+      (org-fc-embed-uncloze nil)
+    (apply #'org-fc-embed-uncloze (org-element-at-point))))
 
 (cl-defun org-fc-embed-fc-file-relative (&optional (org-fc-directory (cl-first org-fc-directories)))
   (let ((file (buffer-file-name (current-buffer))))
@@ -140,36 +214,6 @@
        (substitute-command-keys
         "\\<org-fc-embed-export-mode-map>Flashcard export buffer.  Finish `\\[org-fc-embed-export-finalize]', abort `\\[org-fc-embed-export-kill]'."))
     (setq-local header-line-format nil)))
-
-(cl-defun org-fc-embed-remove-comments (&optional (start (point-min)) (end (point-max)))
-  (save-excursion
-    (cl-loop initially (goto-char start)
-             while (re-search-forward (rx "@@comment:" (*? anychar) "@@" (* blank)) end t)
-             do (replace-match "")
-             sum 1)))
-
-(cl-defun org-fc-embed-process-clozes (&optional (start (point-min)) (end (point-max)) (process-function #'cl-values))
-  (save-excursion
-    (cl-loop with start = (copy-marker start) and end = (copy-marker end)
-             with regexp = (rx "@@fc:" (group (+? anychar)) "@@")
-             initially (goto-char start)
-             for cloze-start = (if (not (re-search-forward regexp end t))
-                                   (cl-return count)
-                                 (cl-assert (string-equal (match-string 1) "{{"))
-                                 (prog1 (save-excursion
-                                          (goto-char (match-end 0))
-                                          (point-marker))
-                                   (replace-match "\\1")))
-             for cloze-end = (if (not (re-search-forward regexp end t))
-                                 (cl-assert nil)
-                               (cl-assert (string-suffix-p "}}" (match-string 1)))
-                               (prog1 (save-excursion
-                                        (goto-char (match-beginning 0))
-                                        (point-marker))
-                                 (replace-match "\\1")))
-             for count from 0
-             for cloze = (string-trim (buffer-substring-no-properties cloze-start cloze-end))
-             do (funcall process-function cloze))))
 
 (cl-defun org-fc-embed-export-clozes (&optional (start (point-min)) (end (point-max)))
   (org-fc-embed-process-clozes
@@ -266,6 +310,13 @@ The flashcard export buffer is current and still narrowed."
       (cl-destructuring-bind (file . position) (org-id-find id)
         (cl-values file position)))))
 
+(cl-defun org-fc-embed-remove-comments (&optional (start (point-min)) (end (point-max)))
+  (save-excursion
+    (cl-loop initially (goto-char start)
+             while (re-search-forward (rx "@@comment:" (*? anychar) "@@" (* blank)) end t)
+             do (replace-match "")
+             sum 1)))
+
 (cl-defgeneric org-fc-embed-update-flashcard (type props)
   (let* ((element (list type props))
          (content (buffer-substring (org-element-begin element) (org-element-end element))))
@@ -324,29 +375,73 @@ The flashcard export buffer is current and still narrowed."
           (apply #'org-fc-embed-update-flashcard element)
         (apply #'org-fc-embed-export-flashcard element)))))
 
-(cl-defun org-fc-embed-uncloze (&optional (start (point-min)) (end (point-max)))
-  (let ((start (copy-marker start)) (end (copy-marker end)))
-    (prog1 (org-fc-embed-process-clozes
-            start end
-            (lambda (cloze)
-              (cl-assert (looking-back (rx "{{" (literal cloze) "}" (*? anychar) "}") (pos-bol)))
-              (replace-match cloze)))
-      (org-fc-embed-update-overlays start end))))
+(cl-defun org-fc-embed-cloze-table-fields (&optional (range '(1 . 1)))
+  (cl-multiple-value-bind (row-start row-end column-start column-end)
+      (cl-flet ((ensure-range (object)
+                  (cl-typecase object
+                    (cons (list (car object) (cdr object)))
+                    (fixnum (list object most-positive-fixnum)))))
+        (cl-etypecase range
+          (cons (cl-values-list (nconc (ensure-range (car range)) (ensure-range (cdr range)))))
+          (fixnum (cl-values-list (nconc (ensure-range range) (ensure-range 0))))
+          (string
+           (string-match
+            (rx-let ((ref (or (+ (char "<>")) (+ digit))))
+              (rx bos "@" (group ref) "$" (group ref) ".." (optional "@" (group ref) "$" (group ref)) eos))
+            range)
+           (let ((row-start (match-string 1 range))
+                 (column-start (match-string 2 range))
+                 (row-end (match-string 3 range))
+                 (column-end (match-string 4 range)))
+             (cl-multiple-value-bind (rows columns)
+                 (cl-loop for line in (org-table-to-lisp)
+                          count (listp line) into rows
+                          when (listp line)
+                          maximize (length line) into columns
+                          finally (cl-return (cl-values rows columns)))
+               (cl-flet ((parse-ref (desc count)
+                           (or (ignore-errors (cl-parse-integer desc))
+                               (let ((desc (cl-loop for char across desc sum (cl-case char (?< 1) (?> -1) (t 0)))))
+                                 (when (cl-plusp desc) (cl-decf desc))
+                                 (mod desc count)))))
+                 (cl-values
+                  (parse-ref row-start rows)
+                  (or (and row-end (parse-ref row-end rows)) (1- rows))
+                  (parse-ref column-start columns)
+                  (or (and column-end (parse-ref column-end columns)) (1- columns)))))))))
+    (save-excursion
+      (set-mark (org-table-begin))
+      (goto-char (org-table-end))
+      (org-fc-embed-uncloze nil)
+      (cl-loop initially (goto-char (org-table-begin))
+               for line in (org-table-to-lisp)
+               when (listp line)
+               do (cl-loop for field in line
+                           for column from 0
+                           do (org-table-next-field)
+                           when (and (<= row-start row row-end) (<= column-start column column-end))
+                           unless (string-empty-p (org-table-get nil nil))
+                           do
+                           (org-table-end-of-field 1)
+                           (cl-assert (looking-back (rx (literal field)) (pos-bol)))
+                           (set-mark (match-beginning 0))
+                           (apply #'org-fc-embed-cloze (org-element-at-point)))
+               count (listp line) into row
+               finally (org-table-align))
+      (org-fc-embed-update-overlays (org-table-begin) (org-table-end)))))
 
-;;;###autoload
-(defun org-fc-embed-uncloze-dwim ()
-  (interactive)
-  (cl-destructuring-bind (start end)
-      (if (region-active-p)
-          (cl-values (region-beginning) (region-end))
-        (let ((regexp-left (rx "@@fc:{{")) (regexp-right (rx "}}@@")))
-          (let ((bl (or (and (save-excursion (re-search-backward regexp-left (pos-bol) t)) (match-beginning 0)) (pos-bol)))
-                (br (or (and (save-excursion (re-search-backward regexp-right (pos-bol) t)) (match-end 0)) (pos-bol)))
-                (fl (or (and (save-excursion (re-search-forward regexp-left (pos-eol) t)) (match-beginning 0)) (pos-eol)))
-                (fr (or (and (save-excursion (re-search-forward regexp-right (pos-eol) t)) (match-end 0)) (pos-eol))))
-            (if (< (1- br) bl (point) fr (1+ fl)) (cl-values bl fr)
-              (cl-assert (< (1- (point)) fl fr)) (cl-values fl fr)))))
-    (org-fc-embed-uncloze start end)))
+(cl-defmethod org-fc-embed-cloze ((_type (eql 'table)) &optional _props)
+  (apply #'org-fc-embed-cloze-table-fields
+         (when org-fc-embed-cloze-interactive-p
+           (list (read-string "Range: " "@<<$<<..@>$>")))))
+
+(cl-defmethod org-fc-embed-uncloze ((type (eql 'table)) &optional props)
+  (save-excursion
+    (let ((element (list type props)))
+      (goto-char (org-element-begin element))
+      (set-mark (org-element-end element))
+      (cl-call-next-method)
+      (org-table-align))))
 
 (provide 'org-fc-embed)
 ;;; org-fc-embed.el ends here
