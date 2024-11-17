@@ -66,23 +66,31 @@
 (cl-defun org-fc-embed-remove-meta-overlays (&optional (start (point-min)) (end (point-max)))
   (remove-overlays start end 'org-fc-meta))
 
+(cl-defun org-fc-embed-put-overlays (&optional (start (point-min)) (end (point-max)))
+  (org-fc-embed-put-cloze-overlays start end)
+  (org-fc-embed-put-meta-overlays start end))
+
+(cl-defun org-fc-embed-remove-overlays (&optional (start (point-min)) (end (point-max)))
+  (org-fc-embed-remove-cloze-overlays start end)
+  (org-fc-embed-remove-meta-overlays start end))
+
+(cl-defun org-fc-embed-update-overlays (&optional (start (point-min)) (end (point-max)))
+  (org-fc-embed-remove-overlays start end)
+  (when org-fc-embed-overlay-mode
+    (org-fc-embed-put-overlays start end)))
+
 (define-minor-mode org-fc-embed-overlay-mode
   "Minor mode for visualizing the status of embedded Org flashcards using overlays."
   :group 'org-fc-embed
   (cl-assert (eq major-mode 'org-mode))
-  (if org-fc-embed-overlay-mode
-      (progn
-        (org-fc-embed-put-cloze-overlays)
-        (org-fc-embed-put-meta-overlays))
-    (org-fc-embed-remove-cloze-overlays)
-    (org-fc-embed-remove-meta-overlays)))
+  (if org-fc-embed-overlay-mode (org-fc-embed-put-overlays) (org-fc-embed-remove-overlays)))
 
 ;;;###autoload
-(cl-defun org-fc-embed-cloze-dwim (&aux marker-start marker-end)
+(cl-defun org-fc-embed-cloze-dwim (&optional hint &aux marker-start marker-end)
   (interactive)
   (save-excursion
     (setf marker-start (point-marker))
-    (call-interactively #'org-fc-cloze-dwim)
+    (if (called-interactively-p 'any) (call-interactively #'org-fc-cloze-dwim) (org-fc-cloze-dwim hint))
     (re-search-forward (rx "}}") (pos-eol))
     (insert "@@")
     (setf marker-end (point-marker))
@@ -99,8 +107,7 @@
     (insert "@@fc:")
     (re-search-forward (rx "{{") marker-end)
     (insert "@@")
-    (when org-fc-embed-overlay-mode
-      (org-fc-embed-put-cloze-overlays marker-start marker-end))))
+    (org-fc-embed-update-overlays marker-start marker-end)))
 
 (cl-defun org-fc-embed-fc-file-relative (&optional (org-fc-directory (cl-first org-fc-directories)))
   (let ((file (buffer-file-name (current-buffer))))
@@ -141,10 +148,10 @@
              do (replace-match "")
              sum 1)))
 
-(cl-defun org-fc-embed-process-clozes (&optional (start (point-min)) (end (point-max)))
+(cl-defun org-fc-embed-process-clozes (&optional (start (point-min)) (end (point-max)) (process-function #'cl-values))
   (save-excursion
-    (cl-loop with regexp = (rx "@@fc:" (group (+? anychar)) "@@")
-             with hashes = (make-hash-table)
+    (cl-loop with start = (copy-marker start) and end = (copy-marker end)
+             with regexp = (rx "@@fc:" (group (+? anychar)) "@@")
              initially (goto-char start)
              for cloze-start = (if (not (re-search-forward regexp end t))
                                    (cl-return count)
@@ -162,13 +169,19 @@
                                  (replace-match "\\1")))
              for count from 0
              for cloze = (string-trim (buffer-substring-no-properties cloze-start cloze-end))
-             for hash = (org-fc-embed-string-hash cloze)
-             do
-             (cl-assert (looking-back "}}" (pos-bol)))
-             (backward-char 1)
-             (cl-assert (null (gethash hash hashes)))
-             (setf (gethash hash hashes) cloze)
-             (insert (format "@%d" hash)))))
+             do (funcall process-function cloze))))
+
+(cl-defun org-fc-embed-export-clozes (&optional (start (point-min)) (end (point-max)))
+  (org-fc-embed-process-clozes
+   start end
+   (let ((hashes (make-hash-table)))
+     (lambda (cloze)
+       (let ((hash (org-fc-embed-string-hash cloze)))
+         (cl-assert (looking-back "}}" (pos-bol)))
+         (backward-char 1)
+         (cl-assert (null (gethash hash hashes)))
+         (setf (gethash hash hashes) cloze)
+         (insert (format "@%d" hash)))))))
 
 (defvar-local org-fc-embed-export-window-configuration nil)
 
@@ -215,7 +228,7 @@ The flashcard export buffer is current and still narrowed."
         (insert content)
         (delete-blank-lines))
       (indent-region (point) (point-max))
-      (when (cl-plusp (org-fc-embed-process-clozes (point)))
+      (when (cl-plusp (org-fc-embed-export-clozes (point)))
         (setf type #'org-fc-type-cloze-init))
       (org-back-to-heading)
       (org-end-of-line)
@@ -240,8 +253,7 @@ The flashcard export buffer is current and still narrowed."
                                     (open-line 1)
                                     (insert indentation)
                                     (insert (format "#+FC_FRONT: [[id:%s][%s]]" id front))))
-                                (when org-fc-embed-overlay-mode
-                                  (org-fc-embed-put-meta-overlays start (point)))))))
+                                (org-fc-embed-update-overlays start (point))))))
                         (remove-hook 'org-fc-embed-prepare-finalize-hook hook))))
          hook)
        nil t))))
@@ -267,7 +279,7 @@ The flashcard export buffer is current and still narrowed."
           (save-excursion (insert content))
           (indent-region (point) (point-max))
           (org-fc-embed-remove-comments (point))
-          (when (cl-plusp (org-fc-embed-process-clozes (point)))
+          (when (cl-plusp (org-fc-embed-export-clozes (point)))
             (cl-assert (string-equal (org-entry-get nil "FC_TYPE") "cloze")))
           (goto-char (point-max)))
         (delete-blank-lines)
@@ -311,6 +323,30 @@ The flashcard export buffer is current and still narrowed."
       (if (org-fc-embed-goto-link-to-flashcard)
           (apply #'org-fc-embed-update-flashcard element)
         (apply #'org-fc-embed-export-flashcard element)))))
+
+(cl-defun org-fc-embed-uncloze (&optional (start (point-min)) (end (point-max)))
+  (let ((start (copy-marker start)) (end (copy-marker end)))
+    (prog1 (org-fc-embed-process-clozes
+            start end
+            (lambda (cloze)
+              (cl-assert (looking-back (rx "{{" (literal cloze) "}" (*? anychar) "}") (pos-bol)))
+              (replace-match cloze)))
+      (org-fc-embed-update-overlays start end))))
+
+;;;###autoload
+(defun org-fc-embed-uncloze-dwim ()
+  (interactive)
+  (cl-destructuring-bind (start end)
+      (if (region-active-p)
+          (cl-values (region-beginning) (region-end))
+        (let ((regexp-left (rx "@@fc:{{")) (regexp-right (rx "}}@@")))
+          (let ((bl (or (and (save-excursion (re-search-backward regexp-left (pos-bol) t)) (match-beginning 0)) (pos-bol)))
+                (br (or (and (save-excursion (re-search-backward regexp-right (pos-bol) t)) (match-end 0)) (pos-bol)))
+                (fl (or (and (save-excursion (re-search-forward regexp-left (pos-eol) t)) (match-beginning 0)) (pos-eol)))
+                (fr (or (and (save-excursion (re-search-forward regexp-right (pos-eol) t)) (match-end 0)) (pos-eol))))
+            (if (< (1- br) bl (point) fr (1+ fl)) (cl-values bl fr)
+              (cl-assert (< (1- (point)) fl fr)) (cl-values fl fr)))))
+    (org-fc-embed-uncloze start end)))
 
 (provide 'org-fc-embed)
 ;;; org-fc-embed.el ends here
