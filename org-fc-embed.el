@@ -52,8 +52,8 @@
     (goto-char start)
     (while (let ((case-fold-search t))
              (re-search-forward
-              (rx (or (and (group-n 1 "@@comment:+fc_front:" (group (+? anychar)) "@@"))
-                      (and bol (* blank) (group-n 1 "#+fc_front:" (+? anychar)) eol)))
+              (rx (or (and (group-n 1 "@@comment:+fc_embedded:" (group (+? anychar)) "@@"))
+                      (and bol (* blank) (group-n 1 "#+fc_embedded:" (+? anychar)) eol)))
               end t))
       (let ((overlay (make-overlay
                       (match-beginning 1)
@@ -297,11 +297,11 @@ The flashcard export buffer is current and still narrowed."
                               (let ((start (point))
                                     (indentation (rx bol (* blank))))
                                 (if (not (and (looking-back indentation (pos-bol)) (looking-at indentation)))
-                                    (insert (format "@@comment:+FC_FRONT: [[id:%s][%s]]@@ " id front))
+                                    (insert (format "@@comment:+FC_EMBEDDED: [[id:%s][%s]]@@ " id front))
                                   (let ((indentation (match-string 0)))
                                     (open-line 1)
                                     (insert indentation)
-                                    (insert (format "#+FC_FRONT: [[id:%s][%s]]" id front))))
+                                    (insert (format "#+FC_EMBEDDED: [[id:%s][%s]]" id front))))
                                 (org-fc-embed-update-overlays start (point))))))
                         (remove-hook 'org-fc-embed-prepare-finalize-hook hook))))
          hook)
@@ -363,7 +363,7 @@ The flashcard export buffer is current and still narrowed."
                when (< element-end current-end) unless (org-at-keyword-p) return (goto-char element-end)
                maximize element-start into fallback-start)
       (or (let ((case-fold-search t))
-            (re-search-forward (rx "+fc_front:" (* blank)) (min current-end child-start) t))
+            (re-search-forward (rx "+fc_embedded:" (* blank)) (min current-end child-start) t))
           (null (goto-char marker))))))
 
 ;;;###autoload
